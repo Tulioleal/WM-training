@@ -1,8 +1,25 @@
-# k8s/training-job.yaml
+# ============================================================================
+# Training Job - Entrenamiento incremental de YOLOv8
+# ============================================================================
+# Uso:
+#   kubectl apply -f k8s/training-job.yaml
+#
+# Flujo automático:
+#   1. Consulta la DB para saber cuándo fue el último training
+#   2. Si es el primer training → usa todas las inferencias verificadas
+#   3. Si hay trainings previos → usa solo inferencias nuevas desde el último
+#   4. Descarga modelo latest de GCS como base para fine-tuning
+#   5. Entrena, evalúa, sube modelo a GCS y registra en DB
+#   6. Actualiza el modelo "latest" en GCS
+#
+# Después del training, reiniciar la API para cargar el nuevo modelo:
+#   kubectl rollout restart deployment/inference-api -n waste-detection
+# ============================================================================
+
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: training-job
+  generateName: training-job-
   namespace: waste-detection
 spec:
   backoffLimit: 2
@@ -19,12 +36,11 @@ spec:
         - name: training
           image: us-central1-docker.pkg.dev/waste-detection-001/waste-detection-prod/training:latest
           args:
-            - "--base-model=gs://waste-detection-001-waste-detection-models-prod/models/latest/yolov8n_waste.pt"
             - "--from-inferences"
             - "--only-verified"
-            - "--since-last-training"
             - "--epochs=50"
             - "--batch-size=16"
+            - "--patience=10"
           envFrom:
             - configMapRef:
                 name: infra-config
