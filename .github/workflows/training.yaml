@@ -2,12 +2,8 @@
 # CI/CD - Training Job (On-Demand)
 # ============================================================================
 #
-# Flujo:
-#   1. Disparar manualmente desde GitHub Actions UI
-#   2. Build y push de la imagen Docker de training
-#   3. Lanza el Job de Kubernetes en GKE
-#   4. Espera a que el Job termine
-#   5. Reinicia la API para cargar el nuevo modelo
+# Disparar manualmente desde: Actions → Training Job → Run workflow
+# Requiere que la imagen ya exista en Artifact Registry (ver build.yaml)
 #
 # ============================================================================
 
@@ -42,55 +38,12 @@ env:
   WORKLOAD_IDENTITY_PROVIDER: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider"
 
 jobs:
-  # ================================================================
-  # Job 1: Build & Push de la imagen Docker
-  # ================================================================
-  build:
-    name: Build Training Image
-    runs-on: ubuntu-latest
-    environment: deploy
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.SERVICE_ACCOUNT }}
-
-      - name: Set image tag
-        run: echo "IMAGE_TAG=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
-
-      - name: Build Docker image
-        run: |
-          docker build \
-            -t ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
-            -t ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            .
-
-      - name: Push Docker image
-        run: |
-          docker push ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          docker push ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-
-  # ================================================================
-  # Job 2: Lanzar Training Job en GKE
-  # ================================================================
   train:
     name: Run Training Job
     runs-on: ubuntu-latest
-    needs: build
     environment: deploy
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -103,6 +56,15 @@ jobs:
           cluster_name: ${{ vars.GKE_CLUSTER }}
           location: ${{ vars.GCP_ZONE }}
 
+      - name: Verify training image exists
+        run: |
+          gcloud artifacts docker images describe \
+            ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            --format="value(image_summary.digest)" || {
+              echo "❌ La imagen de training no existe. Corré el workflow 'Build Training Image' primero."
+              exit 1
+            }
+
       - name: Build training args
         run: |
           ARGS="--from-inferences --only-verified --epochs=${{ inputs.epochs }} --batch-size=${{ inputs.batch_size }} --patience=${{ inputs.patience }}"
@@ -110,10 +72,11 @@ jobs:
             ARGS="$ARGS --all-time"
           fi
           echo "TRAINING_ARGS=$ARGS" >> $GITHUB_ENV
+          echo "📋 Training args: $ARGS"
 
       - name: Launch training Job
         run: |
-          cat <<EOF | kubectl create -f -
+          cat <<'EOF' > /tmp/training-job.yaml
           apiVersion: batch/v1
           kind: Job
           metadata:
@@ -132,8 +95,7 @@ jobs:
                     effect: NoSchedule
                 containers:
                   - name: training
-                    image: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-                    args: [$(echo $TRAINING_ARGS | sed 's/ /", "/g' | sed 's/^/"/' | sed 's/$/"/' )]
+                    image: PLACEHOLDER
                     envFrom:
                       - configMapRef:
                           name: infra-config
@@ -151,14 +113,25 @@ jobs:
                 restartPolicy: Never
           EOF
 
-          # Capturar el nombre del Job creado
+          # Reemplazar imagen y args
+          sed -i "s|image: PLACEHOLDER|image: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest|" /tmp/training-job.yaml
+          
+          # Agregar args como lista YAML
+          ARGS_YAML=$(echo $TRAINING_ARGS | tr ' ' '\n' | sed 's/^/              - "/' | sed 's/$/"/')
+          sed -i "/image:.*training:latest/a\\
+                    args:\\n${ARGS_YAML}" /tmp/training-job.yaml
+
+          kubectl create -f /tmp/training-job.yaml
+
+          # Capturar nombre del Job
+          sleep 2
           JOB_NAME=$(kubectl get jobs -n waste-detection --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
           echo "JOB_NAME=$JOB_NAME" >> $GITHUB_ENV
           echo "✅ Job lanzado: $JOB_NAME"
 
       - name: Wait for training to complete
         run: |
-          echo "⏳ Esperando que el Job $JOB_NAME termine..."
+          echo "⏳ Esperando que el Job $JOB_NAME termine (timeout: 2h)..."
           kubectl wait --for=condition=complete job/$JOB_NAME \
             -n waste-detection \
             --timeout=7200s || {

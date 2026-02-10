@@ -1,0 +1,60 @@
+# ============================================================================
+# CI/CD - Build Training Image
+# ============================================================================
+#
+# Se ejecuta solo cuando cambian archivos relevantes.
+# Buildea y pushea la imagen Docker al Artifact Registry.
+#
+# ============================================================================
+
+name: Build Training Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'train.py'
+      - 'Dockerfile'
+      - 'requirements.txt'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: "training"
+  WORKLOAD_IDENTITY_PROVIDER: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider"
+
+jobs:
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    environment: deploy
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+      - name: Set image tag
+        run: echo "IMAGE_TAG=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -t ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker push ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
