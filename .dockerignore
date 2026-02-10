@@ -1,0 +1,15 @@
+# Ignorar archivos locales pesados
+data/
+output/
+models/
+runs/
+*.pt
+*.weights
+
+# Ignorar basura de Python y Git
+__pycache__/
+*.pyc
+.git
+.env
+venv/
+.ipynb_checkpoints/

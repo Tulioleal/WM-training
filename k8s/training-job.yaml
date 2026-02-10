@@ -1,0 +1,42 @@
+# k8s/training-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: training-job
+  namespace: waste-detection
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400  # Se limpia después de 24h
+  template:
+    spec:
+      serviceAccountName: waste-detection-app-sa
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: training
+          effect: NoSchedule
+      containers:
+        - name: training
+          image: us-central1-docker.pkg.dev/waste-detection-001/waste-detection-prod/training:latest
+          args:
+            - "--base-model=gs://waste-detection-001-waste-detection-models-prod/models/latest/yolov8n_waste.pt"
+            - "--from-inferences"
+            - "--only-verified"
+            - "--since-last-training"
+            - "--epochs=50"
+            - "--batch-size=16"
+          envFrom:
+            - configMapRef:
+                name: infra-config
+            - secretRef:
+                name: db-credentials
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "4"
+              memory: "12Gi"
+              nvidia.com/gpu: 1
+      restartPolicy: Never

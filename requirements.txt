@@ -1,0 +1,37 @@
+# ============================================================================
+# 1. PRIORIDAD CRÍTICA: OpenCV Headless
+# ============================================================================
+# Debe ir PRIMERO para evitar que ultralytics instale la versión con GUI (pesada)
+opencv-python-headless>=4.9.0.80
+
+# ============================================================================
+# 2. Core Framework
+# ============================================================================
+# Nota: Torch y Torchvision NO están aquí porque se instalan manualmente 
+# en el Dockerfile para aprovechar la caché y configurar CUDA correctamente.
+ultralytics==8.0.196
+
+# ============================================================================
+# 3. Dependencias Explícitas del Proyecto
+# ============================================================================
+# Estas librerías se importan explícitamente en tu train.py o son necesarias
+# para la infraestructura, por lo que es bueno mantenerlas listadas.
+
+pandas>=2.1.4
+python-dotenv>=1.0.0
+google-cloud-storage>=2.14.0
+asyncpg>=0.29.0
+
+# ============================================================================
+# 4. Dependencias Implícitas (Comentadas/Opcionales)
+# ============================================================================
+# Ultralytics ya instala automáticamente las siguientes librerías.
+# Se han eliminado/comentado para dejar que Ultralytics gestione la mejor 
+# versión compatible y evitar conflictos durante el build.
+# ----------------------------------------------------------------------------
+# numpy
+# Pillow
+# PyYAML
+# tqdm
+# matplotlib
+# seaborn
