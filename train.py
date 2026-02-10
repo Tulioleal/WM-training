@@ -14,6 +14,8 @@ from typing import Optional, Dict, Any
 
 import yaml
 import torch
+import asyncio
+import asyncpg
 from ultralytics import YOLO
 
 # Configurar logging
@@ -138,28 +140,136 @@ class TrainingService:
         
         return local_dir
     
+    def _get_last_training_start(self) -> Optional[datetime]:
+        """
+        Consulta la DB para obtener el started_at del último entrenamiento completado.
+        Si no hay entrenamientos previos, retorna None (usar todo).
+        """
+        if not self.database_url:
+            return None
+        
+        async def _query():
+            conn = await asyncpg.connect(self.database_url)
+            try:
+                return await conn.fetchval("""
+                    SELECT started_at FROM trainings
+                    WHERE status = 'completed'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """)
+            finally:
+                await conn.close()
+        
+        try:
+            result = asyncio.run(_query())
+            if result:
+                logger.info(f"Último entrenamiento iniciado: {result}")
+            else:
+                logger.info("No hay entrenamientos previos — usando todas las inferencias")
+            return result
+        except Exception as e:
+            logger.warning(f"Error consultando último entrenamiento: {e}")
+            return None
+
+    def _get_valid_request_ids(
+        self,
+        only_verified: bool = False,
+        since: Optional[datetime] = None
+    ) -> list:
+        """
+        Consulta la DB para obtener los request_ids de inferencias válidas.
+        
+        Args:
+            only_verified: Solo incluir verified + corrected
+            since: Solo incluir inferencias posteriores a esta fecha
+            
+        Returns:
+            Lista de dicts con request_id e image_url
+        """
+        if not self.database_url:
+            logger.warning("Sin DB — no se puede filtrar por verificación")
+            return []
+        
+        async def _query():
+            conn = await asyncpg.connect(self.database_url)
+            try:
+                conditions = ["image_url IS NOT NULL"]
+                params = []
+                param_idx = 1
+                
+                if only_verified:
+                    conditions.append(f"verification_status IN ('verified', 'corrected')")
+                
+                if since:
+                    conditions.append(f"timestamp > ${param_idx}")
+                    params.append(since)
+                    param_idx += 1
+                
+                where_clause = " AND ".join(conditions)
+                
+                rows = await conn.fetch(f"""
+                    SELECT request_id, image_url, detection_count
+                    FROM inferences
+                    WHERE {where_clause}
+                    ORDER BY timestamp ASC
+                """, *params)
+                
+                return [dict(r) for r in rows]
+            finally:
+                await conn.close()
+        
+        try:
+            results = asyncio.run(_query())
+            logger.info(f"Inferencias válidas encontradas: {len(results)}")
+            return results
+        except Exception as e:
+            logger.warning(f"Error consultando inferencias: {e}")
+            return []
+
     def prepare_dataset_from_inferences(
         self, 
         images_bucket: str,
         train_split: float = 0.8,
-        min_detections: int = 1
+        min_detections: int = 1,
+        only_verified: bool = False,
+        since_last_training: bool = False
     ) -> Path:
         """
         Prepara un dataset YOLO a partir de las inferencias guardadas.
-        
-        Las inferencias se guardan en:
-        - Imágenes: gs://bucket/inferences/YYYY/MM/DD/{request_id}.jpeg
-        - Anotaciones: gs://bucket/inferences/YYYY/MM/DD/{request_id}.txt
         
         Args:
             images_bucket: Nombre del bucket de imágenes
             train_split: Porcentaje para entrenamiento (0.8 = 80%)
             min_detections: Mínimo de detecciones por imagen
+            only_verified: Solo usar inferencias verificadas/corregidas
+            since_last_training: Solo usar inferencias posteriores al último training
             
         Returns:
             Path al archivo data.yaml
         """
         import random
+        
+        # Determinar fecha de corte
+        since_date = None
+        if since_last_training:
+            since_date = self._get_last_training_start()
+        
+        # Obtener request_ids válidos desde la DB
+        valid_records = self._get_valid_request_ids(
+            only_verified=only_verified,
+            since=since_date
+        )
+        
+        if valid_records:
+            valid_request_ids = {r['request_id'] for r in valid_records}
+            logger.info(
+                f"Filtrado DB: {len(valid_request_ids)} inferencias válidas"
+                f"{' (solo verificadas)' if only_verified else ''}"
+                f"{f' (desde {since_date})' if since_date else ''}"
+            )
+        else:
+            valid_request_ids = None  # Sin DB, no filtrar
+            logger.warning("Sin filtrado de DB — descargando todo del bucket")
         
         logger.info(f"Preparando dataset desde inferencias en gs://{images_bucket}/inferences/")
         
@@ -178,9 +288,12 @@ class TrainingService:
         inference_pairs = {}
         for blob in blobs:
             if blob.name.endswith('.txt') or blob.name.endswith('.jpeg') or blob.name.endswith('.jpg') or blob.name.endswith('.png'):
-                # Extraer request_id del nombre
                 filename = blob.name.split('/')[-1]
                 request_id = filename.rsplit('.', 1)[0]
+                
+                # Filtrar por request_ids válidos si tenemos la lista
+                if valid_request_ids is not None and request_id not in valid_request_ids:
+                    continue
                 
                 if request_id not in inference_pairs:
                     inference_pairs[request_id] = {}
@@ -231,6 +344,9 @@ class TrainingService:
         self.training_info["train_images"] = downloaded_train
         self.training_info["val_images"] = downloaded_val
         self.training_info["source"] = "inferences"
+        self.training_info["only_verified"] = only_verified
+        self.training_info["since_last_training"] = since_last_training
+        self.training_info["cutoff_date"] = since_date.isoformat() if since_date else None
         
         # Crear data.yaml
         data_yaml = dataset_dir / "data.yaml"
@@ -628,6 +744,10 @@ def main():
     # Nuevos argumentos para entrenamiento desde inferencias
     parser.add_argument("--from-inferences", action="store_true", 
                         help="Entrenar usando las inferencias guardadas automáticamente")
+    parser.add_argument("--only-verified", action="store_true",
+                        help="Solo usar inferencias verificadas o corregidas")
+    parser.add_argument("--all-time", action="store_true",
+                        help="Ignorar fecha de último entrenamiento y usar todas las inferencias")
     parser.add_argument("--train-split", type=float, default=0.8,
                         help="Porcentaje de datos para entrenamiento (default: 0.8)")
     parser.add_argument("--min-detections", type=int, default=1,
@@ -659,6 +779,8 @@ def main():
             logger.info("="*60)
             logger.info("MODO: Entrenamiento desde inferencias")
             logger.info(f"Bucket de imágenes: {images_bucket}")
+            logger.info(f"Solo verificadas: {args.only_verified}")
+            logger.info(f"Incremental: {not args.all_time}")
             logger.info(f"Train split: {args.train_split}")
             logger.info(f"Min detecciones: {args.min_detections}")
             logger.info("="*60)
@@ -666,7 +788,9 @@ def main():
             data_yaml = service.prepare_dataset_from_inferences(
                 images_bucket=images_bucket,
                 train_split=args.train_split,
-                min_detections=args.min_detections
+                min_detections=args.min_detections,
+                only_verified=args.only_verified,
+                since_last_training=not args.all_time
             )
         else:
             # Modo tradicional: dataset pre-estructurado
