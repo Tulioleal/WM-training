@@ -76,7 +76,14 @@ jobs:
 
       - name: Launch training Job
         run: |
-          cat <<'EOF' > /tmp/training-job.yaml
+          # Construir args como lista YAML
+          ARGS_YAML=""
+          for arg in $TRAINING_ARGS; do
+            ARGS_YAML="$ARGS_YAML
+                    - \"$arg\""
+          done
+
+          cat <<EOF | kubectl create -f -
           apiVersion: batch/v1
           kind: Job
           metadata:
@@ -95,7 +102,8 @@ jobs:
                     effect: NoSchedule
                 containers:
                   - name: training
-                    image: PLACEHOLDER
+                    image: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+                    args:${ARGS_YAML}
                     envFrom:
                       - configMapRef:
                           name: infra-config
@@ -105,23 +113,13 @@ jobs:
                       requests:
                         cpu: "2"
                         memory: "8Gi"
-                        nvidia.com/gpu: 1
+                        nvidia.com/gpu: "1"
                       limits:
                         cpu: "4"
                         memory: "12Gi"
-                        nvidia.com/gpu: 1
+                        nvidia.com/gpu: "1"
                 restartPolicy: Never
           EOF
-
-          # Reemplazar imagen y args
-          sed -i "s|image: PLACEHOLDER|image: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest|" /tmp/training-job.yaml
-          
-          # Agregar args como lista YAML
-          ARGS_YAML=$(echo $TRAINING_ARGS | tr ' ' '\n' | sed 's/^/              - "/' | sed 's/$/"/')
-          sed -i "/image:.*training:latest/a\\
-                    args:\\n${ARGS_YAML}" /tmp/training-job.yaml
-
-          kubectl create -f /tmp/training-job.yaml
 
           # Capturar nombre del Job
           sleep 2
