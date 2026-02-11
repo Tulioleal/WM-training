@@ -133,6 +133,7 @@ jobs:
           
           RESULT=$(vastai create instance $OFFER_ID \
             --image ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            --login "-u oauth2accesstoken -p $GCS_ACCESS_TOKEN ${{ vars.GCP_REGION }}-docker.pkg.dev" \
             --disk 20 \
             --env "-e GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }} -e GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }} -e GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }} -e GCS_ACCESS_TOKEN=$GCS_ACCESS_TOKEN -e TRAINING_ARGS='$TRAINING_ARGS'" \
             --onstart-cmd "cd /app && python train.py \$TRAINING_ARGS && touch /workspace/TRAINING_COMPLETE" \
