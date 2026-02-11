@@ -1,15 +1,17 @@
 # ============================================================================
-# CI/CD - Training Job via Vertex AI (On-Demand)
+# CI/CD - Training Job via Vast.ai (On-Demand)
 # ============================================================================
 #
-# Disparar manualmente desde: Actions → Training Job → Run workflow
-# Requiere que la imagen ya exista en Artifact Registry (ver build.yaml)
-#
 # Flujo:
-#   1. Lanza un Custom Job en Vertex AI con GPU
-#   2. El container descarga datos de GCS, entrena, sube modelo a GCS
-#   3. Registra el modelo en la DB
-#   4. Reinicia la API en GKE para cargar el nuevo modelo
+#   1. Llama a la API para exportar datos verificados a GCS
+#   2. Lanza instancia en Vast.ai con GPU
+#   3. La instancia ejecuta el training (lee export de GCS, entrena, sube modelo)
+#   4. Destruye la instancia
+#   5. Reinicia la API en GKE para cargar el nuevo modelo
+#
+# Requisitos:
+#   - VAST_API_KEY como secret del repositorio
+#   - La imagen de training debe estar en un registry público o accesible
 #
 # ============================================================================
 
@@ -34,13 +36,6 @@ on:
         description: 'Usar TODAS las inferencias (ignorar último training)'
         default: false
         type: boolean
-      gpu_type:
-        description: 'Tipo de GPU'
-        default: 'NVIDIA_TESLA_T4'
-        type: choice
-        options:
-          - NVIDIA_TESLA_T4
-          - NVIDIA_L4
 
 permissions:
   contents: read
@@ -51,8 +46,11 @@ env:
   WORKLOAD_IDENTITY_PROVIDER: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider"
 
 jobs:
-  train:
-    name: Run Training Job (Vertex AI)
+  # ================================================================
+  # Job 1: Exportar datos verificados a GCS
+  # ================================================================
+  export:
+    name: Export Verified Data to GCS
     runs-on: ubuntu-latest
     environment: deploy
 
@@ -63,108 +61,208 @@ jobs:
           workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.SERVICE_ACCOUNT }}
 
-      - name: Verify training image exists
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GCP_ZONE }}
+
+      - name: Get API endpoint
         run: |
-          gcloud artifacts docker images describe \
-            ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            --format="value(image_summary.digest)" || {
-              echo "❌ La imagen de training no existe. Corré el workflow 'Build Training Image' primero."
-              exit 1
-            }
+          API_IP=$(kubectl get svc inference-api -n waste-detection -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "API_URL=http://$API_IP:8000" >> $GITHUB_ENV
+          echo "📡 API URL: http://$API_IP:8000"
+
+      - name: Export verified data to GCS
+        run: |
+          RESPONSE=$(curl -s -X POST "$API_URL/training/export-to-gcs?min_detections=1")
+          echo "$RESPONSE" | python3 -m json.tool
+          
+          STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','error'))")
+          TOTAL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_records',0))")
+          
+          if [ "$STATUS" = "empty" ]; then
+            echo "❌ No hay datos verificados para entrenar"
+            exit 1
+          fi
+          
+          echo "✅ Exportados $TOTAL registros verificados a GCS"
+
+  # ================================================================
+  # Job 2: Training en Vast.ai
+  # ================================================================
+  train:
+    name: Run Training (Vast.ai)
+    runs-on: ubuntu-latest
+    needs: export
+    environment: deploy
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+      - name: Create GCS service account key
+        run: |
+          # Crear key temporal para que Vast.ai acceda a GCS
+          gcloud iam service-accounts keys create /tmp/gcs-key.json \
+            --iam-account=${{ vars.SERVICE_ACCOUNT }}
+          
+          # Codificar en base64 para pasar como env var
+          GCS_KEY_B64=$(base64 -w 0 /tmp/gcs-key.json)
+          echo "GCS_KEY_B64=$GCS_KEY_B64" >> $GITHUB_ENV
+          rm /tmp/gcs-key.json
+
+      - name: Install Vast.ai CLI
+        run: |
+          pip install vastai
+          vastai set api-key ${{ secrets.VAST_API_KEY }}
 
       - name: Build training args
         run: |
-          ARGS="--from-inferences,--only-verified,--epochs=${{ inputs.epochs }},--batch-size=${{ inputs.batch_size }},--patience=${{ inputs.patience }}"
+          ARGS="--from-inferences --only-verified --epochs=${{ inputs.epochs }} --batch-size=${{ inputs.batch_size }} --patience=${{ inputs.patience }}"
           if [ "${{ inputs.all_time }}" = "true" ]; then
-            ARGS="$ARGS,--all-time"
+            ARGS="$ARGS --all-time"
           fi
           echo "TRAINING_ARGS=$ARGS" >> $GITHUB_ENV
-          echo "📋 Training args: $ARGS"
 
-      - name: Launch Vertex AI Custom Job
+      - name: Find and launch Vast.ai instance
         run: |
-          JOB_NAME="waste-detection-training-$(date +%Y%m%d-%H%M%S)"
-
-          cat <<EOF > /tmp/job_config.yaml
-          workerPoolSpecs:
-            - machineSpec:
-                machineType: n1-standard-4
-                acceleratorType: ${{ inputs.gpu_type }}
-                acceleratorCount: 1
-              replicaCount: 1
-              containerSpec:
-                imageUri: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-                args:
-          $(echo $TRAINING_ARGS | tr ',' '\n' | sed 's/^/                - /')
-                env:
-                  - name: GCS_MODELS_BUCKET
-                    value: "${{ vars.GCS_MODELS_BUCKET }}"
-                  - name: GCS_IMAGES_BUCKET
-                    value: "${{ vars.GCS_IMAGES_BUCKET }}"
-                  - name: GCS_DATASETS_BUCKET
-                    value: "${{ vars.GCS_DATASETS_BUCKET }}"
-                  - name: DATABASE_URL
-                    value: "${{ secrets.DATABASE_URL }}"
-          EOF
-
-          gcloud ai custom-jobs create \
-            --region=${{ vars.GCP_REGION }} \
-            --display-name="$JOB_NAME" \
-            --network=projects/${{ secrets.GCP_PROJECT_NUMBER }}/global/networks/waste-detection-vpc-prod \
-            --config=/tmp/job_config.yaml \
-            --format="value(name)" > /tmp/job_name.txt
-
-          FULL_JOB_NAME=$(cat /tmp/job_name.txt)
-          echo "JOB_ID=$FULL_JOB_NAME" >> $GITHUB_ENV
-          echo "✅ Job lanzado: $FULL_JOB_NAME"
+          # Buscar instancia con T4 o RTX GPU, al menos 12GB VRAM
+          OFFER_ID=$(vastai search offers 'gpu_ram>=12 num_gpus=1 inet_down>=200 reliability>0.95 verified=true' \
+            -o 'dph+' --raw | python3 -c "
+          import sys, json
+          offers = json.load(sys.stdin)
+          if offers:
+              print(offers[0]['id'])
+          else:
+              print('NONE')
+          ")
+          
+          if [ "$OFFER_ID" = "NONE" ]; then
+            echo "❌ No se encontraron ofertas disponibles en Vast.ai"
+            exit 1
+          fi
+          
+          echo "🖥️ Oferta seleccionada: $OFFER_ID"
+          
+          # Crear on-start script
+          cat <<'SCRIPT' > /tmp/onstart.sh
+          #!/bin/bash
+          set -e
+          
+          # Decodificar service account key
+          echo "$GCS_KEY_B64" | base64 -d > /tmp/gcs-key.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcs-key.json
+          
+          # Ejecutar training
+          cd /app
+          python train.py $TRAINING_ARGS
+          
+          # Señalizar que terminó
+          touch /workspace/TRAINING_COMPLETE
+          SCRIPT
+          
+          # Lanzar instancia
+          RESULT=$(vastai create instance $OFFER_ID \
+            --image ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            --login '-u oauth2accesstoken -p $(gcloud auth print-access-token) https://${{ vars.GCP_REGION }}-docker.pkg.dev' \
+            --disk 20 \
+            --env "-e GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }} -e GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }} -e GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }} -e GCS_KEY_B64=$GCS_KEY_B64 -e TRAINING_ARGS='$TRAINING_ARGS'" \
+            --onstart-cmd "bash -c 'echo \$GCS_KEY_B64 | base64 -d > /tmp/gcs-key.json && export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcs-key.json && cd /app && python train.py \$TRAINING_ARGS && touch /workspace/TRAINING_COMPLETE'" \
+            --raw)
+          
+          INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_contract',''))")
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "✅ Instancia lanzada: $INSTANCE_ID"
 
       - name: Wait for training to complete
         run: |
-          echo "⏳ Esperando que el Job termine (polling cada 60s, timeout: 2h)..."
+          echo "⏳ Esperando que el training termine (timeout: 2h)..."
           TIMEOUT=7200
           ELAPSED=0
-
+          
           while [ $ELAPSED -lt $TIMEOUT ]; do
-            STATE=$(gcloud ai custom-jobs describe $JOB_ID \
-              --region=${{ vars.GCP_REGION }} \
-              --format="value(state)")
-
-            echo "  Estado: $STATE (${ELAPSED}s)"
-
-            if [ "$STATE" = "JOB_STATE_SUCCEEDED" ]; then
-              echo "✅ Training completado exitosamente"
-              exit 0
-            elif [ "$STATE" = "JOB_STATE_FAILED" ] || [ "$STATE" = "JOB_STATE_CANCELLED" ]; then
-              echo "❌ Training falló con estado: $STATE"
-              gcloud ai custom-jobs describe $JOB_ID \
-                --region=${{ vars.GCP_REGION }} \
-                --format="yaml(error)"
-              exit 1
+            STATUS=$(vastai show instance $INSTANCE_ID --raw | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          print(data.get('actual_status', 'unknown'))
+          " 2>/dev/null || echo "unknown")
+            
+            echo "  Estado: $STATUS (${ELAPSED}s)"
+            
+            # Verificar si terminó mirando los logs
+            if [ "$STATUS" = "exited" ] || [ "$STATUS" = "offline" ]; then
+              echo "✅ Instancia terminó"
+              break
             fi
-
+            
             sleep 60
             ELAPSED=$((ELAPSED + 60))
           done
+          
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "❌ Timeout: el training excedió las 2 horas"
+          fi
 
-          echo "❌ Timeout: el training excedió las 2 horas"
-          exit 1
-
-      - name: Show job details
+      - name: Show training logs
         if: always()
         run: |
-          gcloud ai custom-jobs describe $JOB_ID \
-            --region=${{ vars.GCP_REGION }} \
-            --format="yaml(displayName, state, createTime, endTime, error)"
+          vastai logs $INSTANCE_ID --tail 100 2>/dev/null || echo "No se pudieron obtener los logs"
+
+      - name: Destroy Vast.ai instance
+        if: always()
+        run: |
+          if [ -n "$INSTANCE_ID" ]; then
+            vastai destroy instance $INSTANCE_ID
+            echo "🗑️ Instancia $INSTANCE_ID destruida"
+          fi
+
+      - name: Cleanup service account key
+        if: always()
+        run: |
+          # Listar y borrar la key temporal creada
+          KEYS=$(gcloud iam service-accounts keys list \
+            --iam-account=${{ vars.SERVICE_ACCOUNT }} \
+            --format="value(name)" \
+            --filter="keyType=USER_MANAGED" \
+            --sort-by=~createTime \
+            --limit=1)
+          
+          if [ -n "$KEYS" ]; then
+            gcloud iam service-accounts keys delete $KEYS \
+              --iam-account=${{ vars.SERVICE_ACCOUNT }} --quiet
+            echo "🔑 Key temporal eliminada"
+          fi
+
+  # ================================================================
+  # Job 3: Reiniciar API
+  # ================================================================
+  deploy:
+    name: Deploy New Model
+    runs-on: ubuntu-latest
+    needs: train
+    environment: deploy
+
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
 
       - name: Get GKE credentials
-        if: success()
         uses: google-github-actions/get-gke-credentials@v2
         with:
           cluster_name: ${{ vars.GKE_CLUSTER }}
           location: ${{ vars.GCP_ZONE }}
 
       - name: Restart inference API
-        if: success()
         run: |
           kubectl rollout restart deployment/inference-api -n waste-detection
           kubectl rollout status deployment/inference-api -n waste-detection --timeout=300s

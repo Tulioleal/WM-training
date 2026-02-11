@@ -44,6 +44,7 @@ class TrainingService:
         output_dir: str = "/app/output",
         models_bucket: Optional[str] = None,
         datasets_bucket: Optional[str] = None,
+        images_bucket: Optional[str] = None,
         database_url: Optional[str] = None
     ):
         self.base_model = base_model
@@ -51,6 +52,7 @@ class TrainingService:
         self.output_dir = Path(output_dir)
         self.models_bucket = models_bucket
         self.datasets_bucket = datasets_bucket
+        self.images_bucket = images_bucket
         self.database_url = database_url
         
         # Crear directorios
@@ -178,6 +180,7 @@ class TrainingService:
     ) -> list:
         """
         Consulta la DB para obtener los request_ids de inferencias válidas.
+        Si la DB no está disponible, intenta leer el archivo exportado de GCS.
         
         Args:
             only_verified: Solo incluir verified + corrected
@@ -186,10 +189,58 @@ class TrainingService:
         Returns:
             Lista de dicts con request_id e image_url
         """
-        if not self.database_url:
-            logger.warning("Sin DB — no se puede filtrar por verificación")
+        # Intento 1: Consultar DB directamente
+        if self.database_url:
+            try:
+                results = self._get_valid_request_ids_from_db(only_verified, since)
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Error consultando DB: {e}")
+        
+        # Intento 2: Leer JSON exportado de GCS
+        if self.storage_client and self.images_bucket:
+            try:
+                results = self._get_valid_request_ids_from_gcs()
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Error leyendo export de GCS: {e}")
+        
+        logger.warning("Sin DB ni export de GCS — no se puede filtrar")
+        return []
+
+    def _get_valid_request_ids_from_gcs(self) -> list:
+        """
+        Lee los request_ids desde el JSON exportado en GCS.
+        Archivo: gs://{images_bucket}/training_exports/verified_requests.json
+        """
+        bucket = self.storage_client.bucket(self.images_bucket)
+        blob = bucket.blob("training_exports/verified_requests.json")
+        
+        if not blob.exists():
+            logger.warning("No existe archivo de export en GCS")
             return []
         
+        content = blob.download_as_string().decode('utf-8')
+        export_data = json.loads(content)
+        
+        logger.info(
+            f"Leídos {export_data['total_records']} registros del export de GCS "
+            f"(exportado: {export_data['exported_at']})"
+        )
+        
+        return [
+            {"request_id": d["request_id"], "image_url": d.get("image_url")}
+            for d in export_data.get("data", [])
+        ]
+
+    def _get_valid_request_ids_from_db(
+        self,
+        only_verified: bool = False,
+        since: Optional[datetime] = None
+    ) -> list:
+        """Consulta la DB directamente para obtener request_ids válidos."""
         async def _query():
             conn = await asyncpg.connect(self.database_url)
             try:
@@ -198,7 +249,7 @@ class TrainingService:
                 param_idx = 1
                 
                 if only_verified:
-                    conditions.append(f"verification_status IN ('verified', 'corrected')")
+                    conditions.append("verification_status IN ('verified', 'corrected')")
                 
                 if since:
                     conditions.append(f"timestamp > ${param_idx}")
@@ -218,13 +269,9 @@ class TrainingService:
             finally:
                 await conn.close()
         
-        try:
-            results = asyncio.run(_query())
-            logger.info(f"Inferencias válidas encontradas: {len(results)}")
-            return results
-        except Exception as e:
-            logger.warning(f"Error consultando inferencias: {e}")
-            return []
+        results = asyncio.run(_query())
+        logger.info(f"Inferencias válidas desde DB: {len(results)}")
+        return results
 
     def prepare_dataset_from_inferences(
         self, 
@@ -766,6 +813,7 @@ def main():
         base_model=args.base_model,
         models_bucket=models_bucket,
         datasets_bucket=datasets_bucket,
+        images_bucket=images_bucket,
         database_url=database_url
     )
     
@@ -836,4 +884,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
