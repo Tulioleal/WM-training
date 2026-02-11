@@ -174,8 +174,7 @@ jobs:
             --login '-u oauth2accesstoken -p $(gcloud auth print-access-token) https://${{ vars.GCP_REGION }}-docker.pkg.dev' \
             --disk 20 \
             --env "-e GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }} -e GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }} -e GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }} -e GCS_KEY_B64=$GCS_KEY_B64 -e TRAINING_ARGS='$TRAINING_ARGS'" \
-            --onstart-cmd "bash -c 'echo \$GCS_KEY_B64 | base64 -d > /tmp/gcs-key.json && export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcs-key.json && cd /app && python train.py \$TRAINING_ARGS && touch /workspace/TRAINING_COMPLETE'" \
-            --raw)
+            --onstart-cmd "cd /app && python train.py $TRAINING_ARGS && touch /workspace/TRAINING_COMPLETE"
           
           INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_contract',''))")
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV

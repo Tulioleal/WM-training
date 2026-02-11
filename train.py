@@ -67,9 +67,23 @@ class TrainingService:
         self.storage_client = None
         self.db_pool = None
         
+        # ANTES (línea 68-70):
         if models_bucket:
             from google.cloud import storage
             self.storage_client = storage.Client()
+
+        # DESPUÉS:
+        if models_bucket:
+            from google.cloud import storage
+            access_token = os.environ.get("GCS_ACCESS_TOKEN")
+            if access_token:
+                from google.oauth2.credentials import Credentials
+                creds = Credentials(token=access_token)
+                self.storage_client = storage.Client(credentials=creds)
+                logger.info("Storage client inicializado con access token")
+            else:
+                self.storage_client = storage.Client()
+                logger.info("Storage client inicializado con credenciales default")
     
     def generate_version(self) -> str:
         """Genera una versión única basada en timestamp"""
