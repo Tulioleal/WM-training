@@ -85,13 +85,33 @@ jobs:
         run: |
           JOB_NAME="waste-detection-training-$(date +%Y%m%d-%H%M%S)"
 
+          cat <<EOF > /tmp/job_config.yaml
+          workerPoolSpecs:
+            - machineSpec:
+                machineType: n1-standard-4
+                acceleratorType: ${{ inputs.gpu_type }}
+                acceleratorCount: 1
+              replicaCount: 1
+              containerSpec:
+                imageUri: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+                args:
+          $(echo $TRAINING_ARGS | tr ',' '\n' | sed 's/^/                - /')
+                env:
+                  - name: GCS_MODELS_BUCKET
+                    value: "${{ vars.GCS_MODELS_BUCKET }}"
+                  - name: GCS_IMAGES_BUCKET
+                    value: "${{ vars.GCS_IMAGES_BUCKET }}"
+                  - name: GCS_DATASETS_BUCKET
+                    value: "${{ vars.GCS_DATASETS_BUCKET }}"
+                  - name: DATABASE_URL
+                    value: "${{ secrets.DATABASE_URL }}"
+          EOF
+
           gcloud ai custom-jobs create \
             --region=${{ vars.GCP_REGION }} \
             --display-name="$JOB_NAME" \
             --network=projects/${{ secrets.GCP_PROJECT_NUMBER }}/global/networks/waste-detection-vpc-prod \
-            --worker-pool-spec=machine-type=n1-standard-4,accelerator-type=${{ inputs.gpu_type }},accelerator-count=1,container-image-uri=${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            --args="$TRAINING_ARGS" \
-            --env-vars="GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }},GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }},GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }},DATABASE_URL=${{ secrets.DATABASE_URL }}" \
+            --config=/tmp/job_config.yaml \
             --format="value(name)" > /tmp/job_name.txt
 
           FULL_JOB_NAME=$(cat /tmp/job_name.txt)
