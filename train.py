@@ -33,8 +33,12 @@ class TrainingService:
     
     # Clases de desechos
     CLASSES = [
-        "plastico", "papel", "carton", "vidrio", "metal",
-        "organico", "textil", "electronico", "peligroso", "otros"
+        "biodegradable",
+        "cardboard",
+        "glass",
+        "metal",
+        "paper",
+        "plastic",
     ]
     
     def __init__(
