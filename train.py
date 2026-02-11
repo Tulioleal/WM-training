@@ -67,19 +67,14 @@ class TrainingService:
         self.storage_client = None
         self.db_pool = None
         
-        # ANTES (línea 68-70):
-        if models_bucket:
-            from google.cloud import storage
-            self.storage_client = storage.Client()
-
-        # DESPUÉS:
         if models_bucket:
             from google.cloud import storage
             access_token = os.environ.get("GCS_ACCESS_TOKEN")
             if access_token:
                 from google.oauth2.credentials import Credentials
                 creds = Credentials(token=access_token)
-                self.storage_client = storage.Client(credentials=creds)
+                project_id = os.environ.get("GCP_PROJECT_ID", "waste-detection-001")
+                self.storage_client = storage.Client(credentials=creds, project=project_id)
                 logger.info("Storage client inicializado con access token")
             else:
                 self.storage_client = storage.Client()
