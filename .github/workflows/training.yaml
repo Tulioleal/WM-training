@@ -1,20 +1,6 @@
 # ============================================================================
 # CI/CD - Training Job via Vast.ai (On-Demand)
 # ============================================================================
-#
-# Flujo:
-#   1. Llama a la API para exportar datos verificados a GCS
-#   2. Lanza instancia en Vast.ai con GPU
-#   3. La instancia ejecuta el training (lee export de GCS, entrena, sube modelo)
-#   4. Destruye la instancia
-#   5. Reinicia la API en GKE para cargar el nuevo modelo
-#
-# Requisitos:
-#   - VAST_API_KEY como secret del repositorio
-#   - La imagen de training debe estar en un registry público o accesible
-#
-# ============================================================================
-
 name: Training Job
 
 on:
@@ -107,6 +93,12 @@ jobs:
           workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.SERVICE_ACCOUNT }}
 
+      - name: Generate GCS access token
+        run: |
+          ACCESS_TOKEN=$(gcloud auth print-access-token)
+          echo "GCS_ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+          echo "✅ Access token generado"
+
       - name: Install Vast.ai CLI
         run: |
           pip install vastai
@@ -122,7 +114,6 @@ jobs:
 
       - name: Find and launch Vast.ai instance
         run: |
-          # Buscar instancia con T4 o RTX GPU, al menos 12GB VRAM
           OFFER_ID=$(vastai search offers 'gpu_ram>=12 num_gpus=1 inet_down>=200 reliability>0.95 verified=true' \
             -o 'dph+' --raw | python3 -c "
           import sys, json
@@ -140,30 +131,12 @@ jobs:
           
           echo "🖥️ Oferta seleccionada: $OFFER_ID"
           
-          # Crear on-start script
-          cat <<'SCRIPT' > /tmp/onstart.sh
-          #!/bin/bash
-          set -e
-          
-          # Decodificar service account key
-          echo "$GCS_KEY_B64" | base64 -d > /tmp/gcs-key.json
-          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcs-key.json
-          
-          # Ejecutar training
-          cd /app
-          python train.py $TRAINING_ARGS
-          
-          # Señalizar que terminó
-          touch /workspace/TRAINING_COMPLETE
-          SCRIPT
-          
-          # Lanzar instancia
           RESULT=$(vastai create instance $OFFER_ID \
             --image ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            --login '-u oauth2accesstoken -p $(gcloud auth print-access-token) https://${{ vars.GCP_REGION }}-docker.pkg.dev' \
             --disk 20 \
-            --env "-e GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }} -e GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }} -e GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }} -e GCS_KEY_B64=$GCS_KEY_B64 -e TRAINING_ARGS='$TRAINING_ARGS'" \
-            --onstart-cmd "cd /app && python train.py $TRAINING_ARGS && touch /workspace/TRAINING_COMPLETE"
+            --env "-e GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }} -e GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }} -e GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }} -e GCS_ACCESS_TOKEN=$GCS_ACCESS_TOKEN -e TRAINING_ARGS='$TRAINING_ARGS'" \
+            --onstart-cmd "cd /app && python train.py \$TRAINING_ARGS && touch /workspace/TRAINING_COMPLETE" \
+            --raw)
           
           INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_contract',''))")
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
@@ -184,7 +157,6 @@ jobs:
             
             echo "  Estado: $STATUS (${ELAPSED}s)"
             
-            # Verificar si terminó mirando los logs
             if [ "$STATUS" = "exited" ] || [ "$STATUS" = "offline" ]; then
               echo "✅ Instancia terminó"
               break
@@ -211,23 +183,6 @@ jobs:
             echo "🗑️ Instancia $INSTANCE_ID destruida"
           fi
 
-      - name: Cleanup service account key
-        if: always()
-        run: |
-          # Listar y borrar la key temporal creada
-          KEYS=$(gcloud iam service-accounts keys list \
-            --iam-account=${{ vars.SERVICE_ACCOUNT }} \
-            --format="value(name)" \
-            --filter="keyType=USER_MANAGED" \
-            --sort-by=~createTime \
-            --limit=1)
-          
-          if [ -n "$KEYS" ]; then
-            gcloud iam service-accounts keys delete $KEYS \
-              --iam-account=${{ vars.SERVICE_ACCOUNT }} --quiet
-            echo "🔑 Key temporal eliminada"
-          fi
-
   # ================================================================
   # Job 3: Reiniciar API
   # ================================================================
@@ -252,6 +207,6 @@ jobs:
 
       - name: Restart inference API
         run: |
-          kubectl rollout status deployment/inference-api -n waste-detection --timeout=300s
+          kubectl rollout restart deployment/inference-api -n waste-detection
           kubectl rollout status deployment/inference-api -n waste-detection --timeout=300s
           echo "✅ API reiniciada con el nuevo modelo"
