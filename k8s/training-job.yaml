@@ -13,7 +13,7 @@
 #   6. Actualiza el modelo "latest" en GCS
 #
 # Después del training, reiniciar la API para cargar el nuevo modelo:
-#   kubectl rollout restart deployment/inference-api -n waste-detection
+#   kubectl rollout status deployment/inference-api -n waste-detection --timeout=300s
 # ============================================================================
 
 apiVersion: batch/v1

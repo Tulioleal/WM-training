@@ -69,7 +69,7 @@ jobs:
 
       - name: Get API endpoint
         run: |
-          API_IP=$(kubectl get svc inference-api -n waste-detection -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          API_IP=$(kubectl get svc inference-api-service -n waste-detection -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           echo "API_URL=http://$API_IP:8000" >> $GITHUB_ENV
           echo "📡 API URL: http://$API_IP:8000"
 
@@ -264,6 +264,6 @@ jobs:
 
       - name: Restart inference API
         run: |
-          kubectl rollout restart deployment/inference-api -n waste-detection
+          kubectl rollout status deployment/inference-api -n waste-detection --timeout=300s
           kubectl rollout status deployment/inference-api -n waste-detection --timeout=300s
           echo "✅ API reiniciada con el nuevo modelo"
