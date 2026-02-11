@@ -81,10 +81,6 @@ jobs:
           echo "TRAINING_ARGS=$ARGS" >> $GITHUB_ENV
           echo "📋 Training args: $ARGS"
 
-      - name: Enable Vertex AI API
-        run: |
-          gcloud services enable aiplatform.googleapis.com --quiet
-
       - name: Launch Vertex AI Custom Job
         run: |
           JOB_NAME="waste-detection-training-$(date +%Y%m%d-%H%M%S)"
