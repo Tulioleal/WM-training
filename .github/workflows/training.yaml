@@ -149,25 +149,27 @@ jobs:
           ELAPSED=0
           
           while [ $ELAPSED -lt $TIMEOUT ]; do
-            STATUS=$(vastai show instance $INSTANCE_ID --raw | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          print(data.get('actual_status', 'unknown'))
-          " 2>/dev/null || echo "unknown")
+            LOGS=$(vastai logs $INSTANCE_ID --tail 5 2>/dev/null || echo "")
             
-            echo "  Estado: $STATUS (${ELAPSED}s)"
-            
-            if [ "$STATUS" = "exited" ] || [ "$STATUS" = "offline" ]; then
-              echo "✅ Instancia terminó"
+            if echo "$LOGS" | grep -q "Pipeline completado"; then
+              echo "✅ Training completado exitosamente"
               break
             fi
             
+            if echo "$LOGS" | grep -q "Error en pipeline"; then
+              echo "❌ Training falló"
+              vastai logs $INSTANCE_ID --tail 50
+              exit 1
+            fi
+            
+            echo "  Esperando... (${ELAPSED}s)"
             sleep 60
             ELAPSED=$((ELAPSED + 60))
           done
           
           if [ $ELAPSED -ge $TIMEOUT ]; then
             echo "❌ Timeout: el training excedió las 2 horas"
+            exit 1
           fi
 
       - name: Show training logs
