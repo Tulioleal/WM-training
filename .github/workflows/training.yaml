@@ -107,17 +107,6 @@ jobs:
           workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.SERVICE_ACCOUNT }}
 
-      - name: Create GCS service account key
-        run: |
-          # Crear key temporal para que Vast.ai acceda a GCS
-          gcloud iam service-accounts keys create /tmp/gcs-key.json \
-            --iam-account=${{ vars.SERVICE_ACCOUNT }}
-          
-          # Codificar en base64 para pasar como env var
-          GCS_KEY_B64=$(base64 -w 0 /tmp/gcs-key.json)
-          echo "GCS_KEY_B64=$GCS_KEY_B64" >> $GITHUB_ENV
-          rm /tmp/gcs-key.json
-
       - name: Install Vast.ai CLI
         run: |
           pip install vastai
