@@ -149,7 +149,7 @@ jobs:
           ELAPSED=0
           
           while [ $ELAPSED -lt $TIMEOUT ]; do
-            LOGS=$(vastai logs $INSTANCE_ID --tail 5 2>/dev/null || echo "")
+            LOGS=$(vastai logs $INSTANCE_ID --tail 200 2>/dev/null || echo "")
             
             if echo "$LOGS" | grep -q "Pipeline completado"; then
               echo "✅ Training completado exitosamente"
