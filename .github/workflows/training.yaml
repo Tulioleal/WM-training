@@ -1,9 +1,15 @@
 # ============================================================================
-# CI/CD - Training Job (On-Demand)
+# CI/CD - Training Job via Vertex AI (On-Demand)
 # ============================================================================
 #
 # Disparar manualmente desde: Actions → Training Job → Run workflow
 # Requiere que la imagen ya exista en Artifact Registry (ver build.yaml)
+#
+# Flujo:
+#   1. Lanza un Custom Job en Vertex AI con GPU
+#   2. El container descarga datos de GCS, entrena, sube modelo a GCS
+#   3. Registra el modelo en la DB
+#   4. Reinicia la API en GKE para cargar el nuevo modelo
 #
 # ============================================================================
 
@@ -28,6 +34,13 @@ on:
         description: 'Usar TODAS las inferencias (ignorar último training)'
         default: false
         type: boolean
+      gpu_type:
+        description: 'Tipo de GPU'
+        default: 'NVIDIA_TESLA_T4'
+        type: choice
+        options:
+          - NVIDIA_TESLA_T4
+          - NVIDIA_L4
 
 permissions:
   contents: read
@@ -39,7 +52,7 @@ env:
 
 jobs:
   train:
-    name: Run Training Job
+    name: Run Training Job (Vertex AI)
     runs-on: ubuntu-latest
     environment: deploy
 
@@ -49,12 +62,6 @@ jobs:
         with:
           workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.SERVICE_ACCOUNT }}
-
-      - name: Get GKE credentials
-        uses: google-github-actions/get-gke-credentials@v2
-        with:
-          cluster_name: ${{ vars.GKE_CLUSTER }}
-          location: ${{ vars.GCP_ZONE }}
 
       - name: Verify training image exists
         run: |
@@ -67,82 +74,78 @@ jobs:
 
       - name: Build training args
         run: |
-          ARGS="--from-inferences --only-verified --epochs=${{ inputs.epochs }} --batch-size=${{ inputs.batch_size }} --patience=${{ inputs.patience }}"
+          ARGS="--from-inferences,--only-verified,--epochs=${{ inputs.epochs }},--batch-size=${{ inputs.batch_size }},--patience=${{ inputs.patience }}"
           if [ "${{ inputs.all_time }}" = "true" ]; then
-            ARGS="$ARGS --all-time"
+            ARGS="$ARGS,--all-time"
           fi
           echo "TRAINING_ARGS=$ARGS" >> $GITHUB_ENV
           echo "📋 Training args: $ARGS"
 
-      - name: Launch training Job
+      - name: Enable Vertex AI API
         run: |
-          # Construir args como lista YAML
-          ARGS_YAML=""
-          for arg in $TRAINING_ARGS; do
-            ARGS_YAML="$ARGS_YAML
-                    - \"$arg\""
-          done
+          gcloud services enable aiplatform.googleapis.com --quiet
 
-          cat <<EOF | kubectl create -f -
-          apiVersion: batch/v1
-          kind: Job
-          metadata:
-            generateName: training-job-
-            namespace: waste-detection
-          spec:
-            backoffLimit: 2
-            ttlSecondsAfterFinished: 86400
-            template:
-              spec:
-                serviceAccountName: waste-detection-app-sa
-                tolerations:
-                  - key: workload
-                    operator: Equal
-                    value: training
-                    effect: NoSchedule
-                containers:
-                  - name: training
-                    image: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-                    args:${ARGS_YAML}
-                    envFrom:
-                      - configMapRef:
-                          name: infra-config
-                      - secretRef:
-                          name: db-credentials
-                    resources:
-                      requests:
-                        cpu: "2"
-                        memory: "8Gi"
-                        nvidia.com/gpu: "1"
-                      limits:
-                        cpu: "4"
-                        memory: "12Gi"
-                        nvidia.com/gpu: "1"
-                restartPolicy: Never
-          EOF
+      - name: Launch Vertex AI Custom Job
+        run: |
+          JOB_NAME="waste-detection-training-$(date +%Y%m%d-%H%M%S)"
 
-          # Capturar nombre del Job
-          sleep 2
-          JOB_NAME=$(kubectl get jobs -n waste-detection --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
-          echo "JOB_NAME=$JOB_NAME" >> $GITHUB_ENV
-          echo "✅ Job lanzado: $JOB_NAME"
+          gcloud ai custom-jobs create \
+            --region=${{ vars.GCP_REGION }} \
+            --display-name="$JOB_NAME" \
+            --network=projects/${{ secrets.GCP_PROJECT_NUMBER }}/global/networks/waste-detection-vpc-prod \
+            --worker-pool-spec=machine-type=n1-standard-4,accelerator-type=${{ inputs.gpu_type }},accelerator-count=1,container-image-uri=${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            --args="$TRAINING_ARGS" \
+            --env-vars="GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }},GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }},GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }},DATABASE_URL=${{ secrets.DATABASE_URL }}" \
+            --format="value(name)" > /tmp/job_name.txt
+
+          FULL_JOB_NAME=$(cat /tmp/job_name.txt)
+          echo "JOB_ID=$FULL_JOB_NAME" >> $GITHUB_ENV
+          echo "✅ Job lanzado: $FULL_JOB_NAME"
 
       - name: Wait for training to complete
         run: |
-          echo "⏳ Esperando que el Job $JOB_NAME termine (timeout: 2h)..."
-          kubectl wait --for=condition=complete job/$JOB_NAME \
-            -n waste-detection \
-            --timeout=7200s || {
-              echo "❌ Training falló o excedió el timeout"
-              kubectl logs job/$JOB_NAME -n waste-detection --tail=50
-              exit 1
-            }
-          echo "✅ Training completado exitosamente"
+          echo "⏳ Esperando que el Job termine (polling cada 60s, timeout: 2h)..."
+          TIMEOUT=7200
+          ELAPSED=0
 
-      - name: Show training logs
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATE=$(gcloud ai custom-jobs describe $JOB_ID \
+              --region=${{ vars.GCP_REGION }} \
+              --format="value(state)")
+
+            echo "  Estado: $STATE (${ELAPSED}s)"
+
+            if [ "$STATE" = "JOB_STATE_SUCCEEDED" ]; then
+              echo "✅ Training completado exitosamente"
+              exit 0
+            elif [ "$STATE" = "JOB_STATE_FAILED" ] || [ "$STATE" = "JOB_STATE_CANCELLED" ]; then
+              echo "❌ Training falló con estado: $STATE"
+              gcloud ai custom-jobs describe $JOB_ID \
+                --region=${{ vars.GCP_REGION }} \
+                --format="yaml(error)"
+              exit 1
+            fi
+
+            sleep 60
+            ELAPSED=$((ELAPSED + 60))
+          done
+
+          echo "❌ Timeout: el training excedió las 2 horas"
+          exit 1
+
+      - name: Show job details
         if: always()
         run: |
-          kubectl logs job/$JOB_NAME -n waste-detection --tail=100
+          gcloud ai custom-jobs describe $JOB_ID \
+            --region=${{ vars.GCP_REGION }} \
+            --format="yaml(displayName, state, createTime, endTime, error)"
+
+      - name: Get GKE credentials
+        if: success()
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GCP_ZONE }}
 
       - name: Restart inference API
         if: success()
