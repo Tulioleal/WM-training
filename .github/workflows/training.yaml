@@ -135,7 +135,7 @@ jobs:
             --image ${{ secrets.DOCKERHUB_USERNAME }}/${{ secrets.DOCKERHUB_REPO }}:latest \
             --disk 20 \
             --env "-e GCS_MODELS_BUCKET=${{ vars.GCS_MODELS_BUCKET }} -e GCS_IMAGES_BUCKET=${{ vars.GCS_IMAGES_BUCKET }} -e GCS_DATASETS_BUCKET=${{ vars.GCS_DATASETS_BUCKET }} -e GCS_ACCESS_TOKEN=$GCS_ACCESS_TOKEN -e GCP_PROJECT_ID=$GCP_PROJECT -e TRAINING_ARGS='$TRAINING_ARGS'" \
-            --onstart-cmd "cd /app && python train.py \$TRAINING_ARGS; kill 1"
+            --onstart-cmd "cd /app && python train.py \$TRAINING_ARGS; kill 1" \
             --raw)
           
           INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('new_contract',''))")
